@@ -38,9 +38,12 @@ NIGHTHAWK_DOCKER_IMAGE = "envoyproxy/nighthawk-dev:59683b759eb8f8bd8cce282795c08
 processes = []
 
 
-def pod_info(filterstr="", namespace=NAMESPACE, multi_ok=True):
-    cmd = "kubectl -n {namespace} get pod {filterstr} -o json".format(
-        namespace=namespace, filterstr=filterstr)
+def pod_info(filterstr="", namespace=NAMESPACE, multi_ok=True, ctx=""):
+    context = "kubectl"
+    if ctx:
+        context = "kubectl --context=" + ctx
+    cmd = "{context} -n {namespace} get pod {filterstr} -o json".format(
+        context=context, namespace=namespace, filterstr=filterstr)
     completed_process = subprocess.run(shlex.split(cmd), capture_output=True, check=True, encoding="utf-8")
     if not completed_process.stdout:
         raise Exception("stdout returned empty for command [%s]" % cmd)
@@ -72,23 +75,31 @@ def run_command_sync(command):
 
 
 # kubectl related helper funcs
-def kubectl_cp(from_file, to_file, container):
-    cmd = "kubectl --namespace {namespace} cp {from_file} {to_file} -c {container}".format(
-        namespace=NAMESPACE,
-        from_file=from_file,
-        to_file=to_file,
-        container=container)
+def kubectl_cp(from_file, to_file, container, ctx=''):
+    context = "kubectl"
+    if ctx:
+        context = "kubectl --context=" + ctx
+    cmd = "{context} --namespace {namespace} cp {from_file} {to_file} -c {container}".format(
+            context=context,
+            namespace=NAMESPACE,
+            from_file=from_file,
+            to_file=to_file,
+            container=container)
     print(cmd, flush=True)
     run_command_sync(cmd)
 
 
-def kubectl_exec(pod, remote_cmd, runfn=run_command, container=None):
+def kubectl_exec(pod, remote_cmd, runfn=run_command, container=None, ctx=''):
     c = ""
+    context = "kubectl"
     if container is not None:
         c = "-c " + container
     else:
         c = "-c " + "uncaptured"
-    cmd = "kubectl --namespace {namespace} exec {pod} {c} -- {remote_cmd}".format(
+    if ctx:
+        context = "kubectl --context=" + ctx
+    cmd = "{context} --namespace {namespace} exec {pod} {c} -- {remote_cmd}".format(
+        context=context,
         pod=pod,
         remote_cmd=remote_cmd,
         c=c,
@@ -116,6 +127,8 @@ class Fortio:
             size=None,
             telemetry_mode="v2-stats-nullvm",
             perf_record=False,
+            server_ctx='',
+            client_ctx='',
             server="fortioserver",
             client="fortioclient",
             additional_args=None,
@@ -147,8 +160,8 @@ class Fortio:
         self.r = "0.000001"
         self.telemetry_mode = telemetry_mode
         self.perf_record = perf_record
-        self.server = pod_info("-lapp=" + server, namespace=self.ns)
-        self.client = pod_info("-lapp=" + client, namespace=self.ns)
+        self.server_ctx = server_ctx
+        self.client_ctx = client_ctx
         self.additional_args = additional_args
         self.filter_fn = filter_fn
         self.extra_labels = extra_labels
@@ -216,7 +229,7 @@ class Fortio:
         print('-------------- Running in {sidecar_mode} mode --------------'.format(sidecar_mode=sidecar_mode))
         if load_gen_type == "fortio":
             p = multiprocessing.Process(target=kubectl_exec,
-                                        args=[self.client.name, sidecar_mode_func(load_gen_cmd, sidecar_mode)])
+                                        args=[self.client.name, sidecar_mode_func(load_gen_cmd, sidecar_mode), run_command, "uncaptured", self.client_ctx])
             p.start()
             processes.append(p)
         elif load_gen_type == "nighthawk":
@@ -482,7 +495,10 @@ def fortio_from_config_file(args):
         fortio.nocatchup = job_config.get("nocatchup", False)
         fortio.keepalive = job_config.get("keepalive", True)
         fortio.connection_reuse = job_config.get("connection_reuse", None)
-
+        fortio.server_ctx = job_config.get("server_ctx", '')
+        fortio.client_ctx = job_config.get("client_ctx", '')
+        fortio.server = pod_info("-lapp=fortioserver", namespace=NAMESPACE, ctx=fortio.server_ctx)
+        fortio.client = pod_info("-lapp=fortioclient", namespace=NAMESPACE, ctx=fortio.client_ctx)
         return fortio
 
 
@@ -522,7 +538,11 @@ def run_perf_test(args):
             nocatchup=args.nocatchup,
             load_gen_type=args.load_gen_type,
             keepalive=args.keepalive,
-            connection_reuse=args.connection_reuse)
+            server_ctx=args.server_ctx,
+            client_ctx=args.client_cxt,
+            connection_reuse=args.connection_reuse,
+            server=pod_info("-lapp=fortioserver", namespace=NAMESPACE, ctx=args.server_ctx),
+            client=pod_info("-lapp=fortioclient", namespace=NAMESPACE, ctx=args.client_ctx))
 
     if fortio.duration <= min_duration:
         print("Duration must be greater than {min_duration}".format(
@@ -699,6 +719,16 @@ def get_parser():
         "--connection_reuse",
         help="Range min:max for the max number of connections to reuse for each thread, default to unlimited.",
         default=None
+    )
+    parser.add_argument(
+        "--server_ctx",
+        help="specify if server and client contexts are different",
+        default=""
+    )
+    parser.add_argument(
+        "--client_ctx",
+        help="specify if server and client contexts are different",
+        default=""
     )
 
     define_bool(parser, "baseline", "run baseline for all", False)
